@@ -1,0 +1,4 @@
+# 规定了搜索引擎抓取工具可以访问您网站上的哪些网址
+# 语法参考：https://developers.google.com/search/docs/crawling-indexing/robots/create-robots-txt?hl=zh-cn#create_rules
+User-agent: *
+Disallow: /hidden

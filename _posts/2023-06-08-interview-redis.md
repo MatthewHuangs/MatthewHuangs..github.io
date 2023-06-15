@@ -544,10 +544,131 @@ Write Back 策略不能应用到 DB 和 Redis 中，因为缺少异步更新的�
 
 ### 1、如何实现延迟队列
 
+**场景：** 订单超时自动取消。
+
+**解决方案：** 使用 `Zset` 实现，用 Score 属性来存储延迟执行的时间。
+![Redis 实现延迟队列](https://cdn.xiaolincoding.com/gh/xiaolincoder/redis/%E5%85%AB%E8%82%A1%E6%96%87/%E5%BB%B6%E8%BF%9F%E9%98%9F%E5%88%97.png)
+
 ### 2、大 key 如何处理
+
+- 定义
+
+key 对应的 value 很大，例如 String 类型的值大于 10KB，Hash、List、Set、ZSet 类型的元素的个数超过5000个。
+
+- 影响 
+
+1、**客户端超时阻塞。** 由于 Redis 执行命令是单线程处理，然后在操作大 key 时会比较耗时，那么就会阻塞 Redis，从客户端这一视角看，就是很久很久都没有响应。
+
+2、**引发网络阻塞。** 每次获取大 key 产生的网络流量较大，如果一个 key 的大小是 1 MB，每秒访问量为 1000，那么每秒会产生 1000MB 的流量，这对于普通千兆网卡的服务器来说是灾难性的。
+
+3、**阻塞工作线程。** 如果使用 del 删除大 key 时，会阻塞工作线程，这样就没办法处理后续的命令。
+
+4、**内存分布不均。** 集群模型在 slot 分片均匀情况下，会出现数据和查询倾斜情况，部分有大 key 的 Redis 节点占用内存多，QPS 也会比较大。
+
+- 找到大 key
+
+1、从节点上执行命令行，会阻塞线程。
+
+`redis-cli -h ${ip} -p ${port} -a ${password} --bigkeys`
+
+2、`SCAN` 命令
+
+3、`RdbTools 第三方开源工具`，解析 RDB 快照文件，将大于 10KB 的 key 输出到表格文件。
+`rdb dump.rdb -c memory --bytes 10240 -f redis.csv`
+
+- 删除大 key
+
+删除操作会涉及释放内存、将释放后的内存块插入一个空闲内存块链表，便于管理和再分配。
+
+1、分批次删除
+
+删除大 Hash，使用 `hscan` 命令每次获取100个字段，再用 `hdel` 命令每次删除1个字段；
+
+删除大 List，通过 `ltrim` 命令每次删除少量元素；
+
+删除大 Set，通过 `sscan` 命令每次扫描集合中100个元素，再用 `srem` 命令每次删除一个键；
+
+删除大 ZSet，使用 `zremrangebyrank` 命令，每次删除 top100 个元素。
+
+2、异步删除（4.0之后）
+
+用 `unlink` 命令来代替 del 删除。
+
+还可以通过配置参数（默认关闭，建议开启前三），在达到某些条件后自动进行异步删除：
+
+```shell
+lazyfree-lazy-eviction: 表示当 Redis 运行内存超过 maxmeory 时，是否开启 lazy free 机制删除；
+lazyfree-lazy-expire: 表示设置的过期时间到期后，是否开启 lazy free 机制删除；
+lazyfree-lazy-server-del: 隐式删除已存在的键时，是否开启 lazy free 机制删除；
+noslave-lazy-flush: 从节点加载主节点的 RDB 文件前，运行 flushall 清理自身数据时，是否开启 lazy free 机制删除。
+```
 
 ### 3、管道有什么用
 
+Pipeline 管道技术是`客户端`提供的一种批处理技术，用于一次性处理多个 Redis 命令，减少多个命令执行时的网络等待。注意避免发送的命令过大，或者管道内的数据太多导致网络阻塞。
+
 ### 4、事务支持回滚吗
 
+Redis 中`没有提供回滚机制，操作非原子性`，`DISCARD` 命令只能主动放弃事务执行，清空命令队列，不能起到回滚效果。
+
+原因在于 Redis 事务执行通常是编程错误导致，以及违背 Redis 追求简单高效的设置主旨。
+
 ### 5、如何实现分布式锁
+
+- 并发问题
+
+读取、保存等操作不是原子操作，所以要用分布式锁来限制程序的并发执行。  
+`setnx`（set if not exists）和`expire`是两个指令而非原子指令，所以直接使用无法实现。
+
+- set 扩展参数（2.8之后）
+
+（1）加锁  
+Redis 实现分布式锁，针对加锁操作需要满足三个条件： 
+a. 加锁包括读取锁变量、检查变量值、设置变量值三个以原子操作方式完成的操作，带上`NX`选项来实现加锁；  
+b. 锁变量要设置过期时间，避免锁异常导致无法释放，带上`EX/PX`选项设置过期时间；  
+c. 锁变量需要能区分来自不同客户端的加锁操作，避免误释放，将锁变量值设置为客户端唯一的值，用于标记客户端。
+
+```bash
+# 以 NX 的方式设置 k-v，只有当 key 不存在时才进行设置操作，并且设置超期时间为10s
+SET ${loack:key} ${unique_value} NX EX 10
+```
+
+（2）解锁  
+解锁操作要保证执行操作的客户端和加锁的客户端是同一个，判断上面锁变量的值`${unique_value}`即可，这里只能使用 Lua 脚本来执行。
+
+```go
+// ReleaseLock del 释放分布式锁，除超期情况外，避免其他线程释放锁
+// 该方法仍非完全线程安全，1、超时且当前线程未执行完，其他线程仍可以侵入；2、value 的比对最好使用 uuid.New().String()
+func ReleaseLock(key string, value interface{}) error {
+	luaScript := `
+	if redis.call("get",KEYS[1]) == ARGV[1]
+	then
+		return redis.call("del",KEYS[1])
+	else
+		return 0
+	end
+	`
+	unlockScript := redis.NewScript(luaScript)
+
+    // func (s *Script) Run(c scripter, keys []string, args ...interface{}) *Cmd
+	_, err := unlockScript.Run(redisClient, []string{key}, value).Result()
+	return err
+}
+```
+
+- 优点
+
+性能高效（缓存实现的核心出发点）；  
+实现方便，setnx 方法；  
+避免单点故障，Redis 跨集群部署。
+
+- 缺点
+
+超时时间不好设置，会收到业务代码执行时间的影响（设置超时时间的同时启动一个守护线程重置超时时间）；  
+Redis 主从复制模式中的数据是异步复制的，导致分布式锁不可靠。
+
+- 集群情况下分布式锁的可靠性
+
+基于多个 Redis 节点的分布式锁，即使有节点发生了故障，锁变量仍然是存在的，客户端还是可以完成锁操作。官方推荐`至少部署5个孤立的 Redis 主节点`。
+
+**Redlock（红锁）：** 让客户端和多个独立的 Redis 节点依次请求申请加锁，如果客户端能够和`半数以上`的节点成功地完成加锁操作，那么我们就认为，客户端成功地获得分布式锁，否则加锁失败。
